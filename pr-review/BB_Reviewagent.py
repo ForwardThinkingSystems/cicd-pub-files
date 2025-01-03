@@ -1,7 +1,6 @@
 import os
 import requests
 import json
-import base64
 from typing import Dict, List, Optional
 
 DEFAULT_PRE_PROMPT = """
@@ -45,7 +44,6 @@ class ClaudePRReviewer:
     def __init__(self):
         self.claude_api_key = os.getenv('CLAUDE_API_KEY')
         self.bitbucket_token = os.getenv('BITBUCKET_TOKEN')
-        # Use custom pre-prompt if provided, otherwise use default
         self.pre_prompt_text = os.getenv('PRE_PROMPT_TEXT', DEFAULT_PRE_PROMPT)
         self.workspace = os.getenv('BITBUCKET_WORKSPACE')
         self.repo_slug = os.getenv('BITBUCKET_REPO_SLUG')
@@ -55,7 +53,6 @@ class ClaudePRReviewer:
         required_vars = {
             'CLAUDE_API_KEY': self.claude_api_key,
             'BITBUCKET_TOKEN': self.bitbucket_token,
-            'BITBUCKET_USERNAME': os.getenv('BITBUCKET_USERNAME'),
             'BITBUCKET_WORKSPACE': self.workspace,
             'BITBUCKET_REPO_SLUG': self.repo_slug,
             'BITBUCKET_PR_ID': self.pr_id
@@ -65,25 +62,19 @@ class ClaudePRReviewer:
         if missing_vars:
             raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_vars)}")
         
-        # Create Basic Auth header for Bitbucket
-        self.bitbucket_auth = base64.b64encode(
-            f"{os.getenv('BITBUCKET_USERNAME')}:{self.bitbucket_token}".encode()
-        ).decode()
-        
         self.bb_api_base = f"https://api.bitbucket.org/2.0/repositories/{self.workspace}/{self.repo_slug}"
         
     def get_pr_changes(self) -> Dict:
         """Fetch the PR diff and changed files."""
-        headers = {"Authorization": f"Basic {self.bitbucket_auth}"}
+        headers = {"Authorization": f"Bearer {self.bitbucket_token}"}
         
         print(f"Making API call to: {self.bb_api_base}/pullrequests/{self.pr_id}/diff")
-        print(f"Using Basic Auth with username: {os.getenv('BITBUCKET_USERNAME')}")
         
         # Get the diff
         diff_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diff"
         diff_response = requests.get(diff_url, headers=headers)
         if diff_response.status_code == 401:
-            print("Authentication failed. Please check your credentials.")
+            print("Authentication failed. Please check the BITBUCKET_TOKEN value.")
             print("Response:", diff_response.text)
             raise Exception("Authentication failed with Bitbucket API")
         diff_response.raise_for_status()
@@ -168,7 +159,7 @@ Format your response as JSON with the following structure:
     def post_comments(self, review: Dict) -> None:
         """Post the review comments to the PR."""
         headers = {
-            "Authorization": f"Basic {self.bitbucket_auth}",
+            "Authorization": f"Bearer {self.bitbucket_token}",
             "Content-Type": "application/json"
         }
         
