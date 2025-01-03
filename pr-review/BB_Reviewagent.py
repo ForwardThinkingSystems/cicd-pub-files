@@ -45,7 +45,7 @@ class ClaudePRReviewer:
     def __init__(self):
         self.claude_api_key = os.getenv('CLAUDE_API_KEY')
         self.bitbucket_username = os.getenv('BITBUCKET_USERNAME')
-        self.bitbucket_token = os.getenv('BITBUCKET_TOKEN')  # This should be your app password
+        self.bitbucket_token = os.getenv('BITBUCKET_TOKEN')
         self.pre_prompt_text = os.getenv('PRE_PROMPT_TEXT', DEFAULT_PRE_PROMPT)
         self.workspace = os.getenv('BITBUCKET_WORKSPACE')
         self.repo_slug = os.getenv('BITBUCKET_REPO_SLUG')
@@ -79,13 +79,17 @@ class ClaudePRReviewer:
         
     def test_auth(self) -> bool:
         """Test authentication with Bitbucket API"""
-        test_url = f"https://api.bitbucket.org/2.0/repositories/{self.workspace}"
-        response = requests.get(test_url, headers=self.headers)
-        if response.status_code != 200:
-            print(f"Authentication test failed with status {response.status_code}")
-            print("Response:", response.text)
+        try:
+            test_url = f"https://api.bitbucket.org/2.0/repositories/{self.workspace}"
+            response = requests.get(test_url, headers=self.headers)
+            if response.status_code != 200:
+                print(f"Authentication test failed with status {response.status_code}")
+                print("Response:", response.text)
+                return False
+            return True
+        except requests.exceptions.RequestException as e:
+            print(f"Authentication test failed with error: {e}")
             return False
-        return True
         
     def get_pr_changes(self) -> Dict:
         """Fetch the PR diff and changed files."""
@@ -95,42 +99,55 @@ class ClaudePRReviewer:
             
         print(f"Making API call to: {self.bb_api_base}/pullrequests/{self.pr_id}/diff")
         
-        # Get the diff
-        diff_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diff"
-        diff_response = requests.get(diff_url, headers=self.headers)
-        if diff_response.status_code == 401:
-            print("Authentication failed. Response:", diff_response.text)
-            raise Exception("Authentication failed with Bitbucket API")
-        diff_response.raise_for_status()
-        
-        # Get the list of changed files
-        files_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diffstat"
-        files_response = requests.get(files_url, headers=self.headers)
-        files_response.raise_for_status()
-        
-        # Get PR description for additional context
-        pr_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}"
-        pr_response = requests.get(pr_url, headers=self.headers)
-        pr_response.raise_for_status()
-        
-        return {
-            "diff": diff_response.text,
-            "changed_files": files_response.json()["values"],
-            "pr_info": pr_response.json()
-        }
+        try:
+            # Get the diff
+            diff_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diff"
+            diff_response = requests.get(diff_url, headers=self.headers)
+            if diff_response.status_code == 401:
+                print("Authentication failed. Response:", diff_response.text)
+                raise Exception("Authentication failed with Bitbucket API")
+            diff_response.raise_for_status()
+            
+            # Get the list of changed files
+            files_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diffstat"
+            files_response = requests.get(files_url, headers=self.headers)
+            files_response.raise_for_status()
+            
+            # Get PR description for additional context
+            pr_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}"
+            pr_response = requests.get(pr_url, headers=self.headers)
+            pr_response.raise_for_status()
+            
+            return {
+                "diff": diff_response.text,
+                "changed_files": files_response.json()["values"],
+                "pr_info": pr_response.json()
+            }
+        except requests.exceptions.RequestException as e:
+            print(f"Failed to fetch PR changes: {e}")
+            raise
         
     def analyze_with_claude(self, changes: Dict) -> Dict:
         """Send the code changes to Claude for analysis."""
         headers = {
             "Content-Type": "application/json",
-            "x-api-key": self.claude_api_key,
-            "anthropic-version": "2024-01-01"
+            "anthropic-version": "2024-01-01",
+            "x-api-key": self.claude_api_key
         }
         
         pr_description = changes['pr_info'].get('description', 'No description provided')
         pr_title = changes['pr_info'].get('title', 'Untitled PR')
         
-        prompt = f"""
+        # Construct the system and user messages
+        system_message = {
+            "role": "system",
+            "content": """You are a code review assistant. Analyze code changes and provide detailed feedback in JSON format.
+Your responses should be valid JSON objects containing 'summary', 'issues', 'recommendations', and 'positive_notes' fields."""
+        }
+        
+        user_message = {
+            "role": "user",
+            "content": f"""
 {self.pre_prompt_text}
 
 Pull Request Information:
@@ -160,30 +177,47 @@ Format your response as JSON with the following structure:
     ],
     "recommendations": ["List of general recommendations"],
     "positive_notes": ["List of good practices identified"]
-}}
-"""
+}}"""
+        }
 
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers=headers,
-            json={
-                "model": "claude-3-sonnet-20240229",
-                "max_tokens": 4096,
-                "messages": [{"role": "user", "content": prompt}]
-            }
-        )
-        response.raise_for_status()
-        
         try:
-            review_content = response.json()["content"][0]["text"]
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json={
+                    "model": "claude-3-sonnet-20240229",
+                    "max_tokens": 4096,
+                    "messages": [system_message, user_message],
+                    "temperature": 0.7,
+                    "system": "You are a code review assistant that provides detailed, specific feedback."
+                }
+            )
+            
+            if response.status_code != 200:
+                print(f"Claude API Error: {response.status_code}")
+                print(f"Response: {response.text}")
+                raise Exception(f"Claude API returned status code {response.status_code}")
+            
+            response_data = response.json()
+            if "content" not in response_data or not response_data["content"]:
+                raise Exception("No content in Claude's response")
+                
+            review_content = response_data["content"][0]["text"]
             return json.loads(review_content)
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed: {e}")
+            raise
         except (json.JSONDecodeError, KeyError) as e:
+            print(f"Failed to parse response: {e}")
+            print(f"Response content: {response.text if 'response' in locals() else 'No response'}")
             raise Exception(f"Failed to parse Claude's response: {e}")
         
     def post_comments(self, review: Dict) -> None:
         """Post the review comments to the PR."""
-        # Create a detailed summary comment
-        summary_markdown = f"""# Claude Code Review Summary
+        try:
+            # Create a detailed summary comment
+            summary_markdown = f"""# Claude Code Review Summary
 
 {review['summary']}
 
@@ -198,41 +232,45 @@ Format your response as JSON with the following structure:
 - Medium Severity: {sum(1 for i in review['issues'] if i['severity'] == 'medium')}
 - Low Severity: {sum(1 for i in review['issues'] if i['severity'] == 'low')}
 """
-        
-        # Post summary comment
-        comments_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/comments"
-        response = requests.post(
-            comments_url, 
-            headers=self.headers, 
-            json={"content": {"raw": summary_markdown}}
-        )
-        response.raise_for_status()
-        
-        # Post individual issue comments
-        for issue in review['issues']:
-            severity_emoji = {
-                'high': '🔴',
-                'medium': '🟡',
-                'low': '🟢'
-            }.get(issue['severity'], '⚪️')
             
-            comment = {
-                "content": {
-                    "raw": f"""**{severity_emoji} {issue['severity'].upper()} Severity {issue['category'].title()} Issue**
+            # Post summary comment
+            comments_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/comments"
+            response = requests.post(
+                comments_url, 
+                headers=self.headers, 
+                json={"content": {"raw": summary_markdown}}
+            )
+            response.raise_for_status()
+            
+            # Post individual issue comments
+            for issue in review['issues']:
+                severity_emoji = {
+                    'high': '🔴',
+                    'medium': '🟡',
+                    'low': '🟢'
+                }.get(issue['severity'], '⚪️')
+                
+                comment = {
+                    "content": {
+                        "raw": f"""**{severity_emoji} {issue['severity'].upper()} Severity {issue['category'].title()} Issue**
 
 {issue['description']}
 
 **Suggestion:** {issue['suggestion']}
 
 {f"✨ **Good Practice!**" if issue.get('good_practice', False) else ""}"""
-                },
-                "inline": {
-                    "path": issue['file'],
-                    "to": issue['line']
+                    },
+                    "inline": {
+                        "path": issue['file'],
+                        "to": issue['line']
+                    }
                 }
-            }
-            response = requests.post(comments_url, headers=self.headers, json=comment)
-            response.raise_for_status()
+                response = requests.post(comments_url, headers=self.headers, json=comment)
+                response.raise_for_status()
+                
+        except requests.exceptions.RequestException as e:
+            print(f"Failed to post comments: {e}")
+            raise
 
     def run_review(self) -> bool:
         """Execute the complete review process."""
