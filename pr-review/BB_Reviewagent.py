@@ -3,6 +3,7 @@ import requests
 import json
 import base64
 from typing import Dict, List, Optional
+from anthropic import Anthropic
 
 DEFAULT_PRE_PROMPT = """
 As a code reviewer, please analyze the changes with the following priorities:
@@ -50,6 +51,9 @@ class ClaudePRReviewer:
         self.workspace = os.getenv('BITBUCKET_WORKSPACE')
         self.repo_slug = os.getenv('BITBUCKET_REPO_SLUG')
         self.pr_id = os.getenv('BITBUCKET_PR_ID')
+        
+        # Initialize Anthropic client
+        self.client = Anthropic(api_key=self.claude_api_key)
         
         # Validate required environment variables
         required_vars = {
@@ -136,27 +140,14 @@ class ClaudePRReviewer:
             raise
         
     def analyze_with_claude(self, changes: Dict) -> Dict:
-        """Send the code changes to Claude for analysis."""
-        headers = {
-            "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01",
-            "x-api-key": self.claude_api_key
-        }
-        
+        """Send the code changes to Claude for analysis using the Anthropic client."""
         pr_description = changes['pr_info'].get('description', 'No description provided')
         pr_title = changes['pr_info'].get('title', 'Untitled PR')
         
         try:
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json={
-                    "model": "claude-3-sonnet-20240229",
-                    "system": "You are a code review assistant. Analyze code changes and provide detailed feedback in JSON format.",
-                    "max_tokens": 4096,
-                    "messages": [{
-                        "role": "user",
-                        "content": f"""
+            system_prompt = "You are a code review assistant. Analyze code changes and provide detailed feedback. Return only the JSON object without any markdown formatting or code blocks."
+            
+            user_message = f"""
 {self.pre_prompt_text}
 
 Pull Request Information:
@@ -170,7 +161,7 @@ Diff Content:
 {changes['diff']}
 
 Please analyze these changes and provide a detailed review following the guidelines above.
-Format your response as JSON with the following structure:
+Respond with only a JSON object (no markdown, no code blocks) using this structure:
 {{
     "summary": "Overall review summary",
     "issues": [
@@ -187,29 +178,40 @@ Format your response as JSON with the following structure:
     "recommendations": ["List of general recommendations"],
     "positive_notes": ["List of good practices identified"]
 }}"""
-                    }]
-                }
+
+            message = self.client.messages.create(
+                model="claude-3-sonnet-20240229",
+                max_tokens=4096,
+                system=system_prompt,
+                messages=[
+                    {"role": "user", "content": user_message}
+                ]
             )
             
-            if response.status_code != 200:
-                print(f"Claude API Error: {response.status_code}")
-                print(f"Response: {response.text}")
-                raise Exception(f"Claude API returned status code {response.status_code}")
+            review_text = message.content[0].text
             
-            response_data = response.json()
-            if "content" not in response_data or not response_data["content"]:
-                raise Exception("No content in Claude's response")
+            # If response is wrapped in markdown code block, extract the JSON
+            if review_text.startswith("```"):
+                start_idx = review_text.find('{')
+                end_idx = review_text.rfind('}') + 1
+                if start_idx == -1 or end_idx == 0:
+                    raise Exception("Could not find valid JSON in response")
+                review_text = review_text[start_idx:end_idx]
+            
+            print("\nParsing Claude's response:")
+            print(review_text)
+            
+            # Parse the JSON
+            try:
+                return json.loads(review_text)
+            except json.JSONDecodeError as e:
+                print(f"\nError parsing JSON: {e}")
+                print("Review text:", review_text)
+                raise
                 
-            review_content = response_data["content"][0]["text"]
-            return json.loads(review_content)
-            
-        except requests.exceptions.RequestException as e:
-            print(f"Request failed: {e}")
+        except Exception as e:
+            print(f"Failed to process Claude's response: {e}")
             raise
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"Failed to parse response: {e}")
-            print(f"Response content: {response.text if 'response' in locals() else 'No response'}")
-            raise Exception(f"Failed to parse Claude's response: {e}")
         
     def post_comments(self, review: Dict) -> None:
         """Post the review comments to the PR."""
