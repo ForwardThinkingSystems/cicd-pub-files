@@ -78,30 +78,36 @@ class ClaudePRReviewer:
         self.bb_api_base = f"https://api.bitbucket.org/2.0/repositories/{self.workspace}/{self.repo_slug}"
         
     def test_auth(self) -> bool:
-        """Test authentication with Bitbucket API"""
+        """Test authentication with Bitbucket API using PR scope"""
         try:
-            test_url = f"https://api.bitbucket.org/2.0/repositories/{self.workspace}"
+            test_url = f"{self.bb_api_base}/pullrequests"
+            print(f"Testing Bitbucket API access to: {test_url}")
             response = requests.get(test_url, headers=self.headers)
-            if response.status_code != 200:
-                print(f"Authentication test failed with status {response.status_code}")
-                print("Response:", response.text)
-                return False
-            return True
+            
+            if response.status_code == 200:
+                print("✅ Bitbucket API authentication successful")
+                return True
+            
+            print(f"❌ Authentication test failed with status {response.status_code}")
+            print("Response:", response.text)
+            return False
+            
         except requests.exceptions.RequestException as e:
-            print(f"Authentication test failed with error: {e}")
+            print(f"❌ Authentication test failed with error: {e}")
             return False
         
     def get_pr_changes(self) -> Dict:
         """Fetch the PR diff and changed files."""
-        print(f"Testing Bitbucket API authentication...")
+        print("🔍 Testing Bitbucket API authentication...")
         if not self.test_auth():
             raise Exception("Failed to authenticate with Bitbucket API")
             
-        print(f"Making API call to: {self.bb_api_base}/pullrequests/{self.pr_id}/diff")
+        print(f"Making API calls to fetch PR data...")
         
         try:
             # Get the diff
             diff_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diff"
+            print(f"Fetching diff from: {diff_url}")
             diff_response = requests.get(diff_url, headers=self.headers)
             if diff_response.status_code == 401:
                 print("Authentication failed. Response:", diff_response.text)
@@ -110,11 +116,13 @@ class ClaudePRReviewer:
             
             # Get the list of changed files
             files_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diffstat"
+            print(f"Fetching changed files from: {files_url}")
             files_response = requests.get(files_url, headers=self.headers)
             files_response.raise_for_status()
             
             # Get PR description for additional context
             pr_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}"
+            print(f"Fetching PR details from: {pr_url}")
             pr_response = requests.get(pr_url, headers=self.headers)
             pr_response.raise_for_status()
             
@@ -138,15 +146,17 @@ class ClaudePRReviewer:
         pr_description = changes['pr_info'].get('description', 'No description provided')
         pr_title = changes['pr_info'].get('title', 'Untitled PR')
         
-        # Construct the messages
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a code review assistant. Analyze code changes and provide detailed feedback in JSON format."
-            },
-            {
-                "role": "user",
-                "content": f"""
+        try:
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json={
+                    "model": "claude-3-sonnet-20240229",
+                    "system": "You are a code review assistant. Analyze code changes and provide detailed feedback in JSON format.",
+                    "max_tokens": 4096,
+                    "messages": [{
+                        "role": "user",
+                        "content": f"""
 {self.pre_prompt_text}
 
 Pull Request Information:
@@ -177,18 +187,7 @@ Format your response as JSON with the following structure:
     "recommendations": ["List of general recommendations"],
     "positive_notes": ["List of good practices identified"]
 }}"""
-            }
-        ]
-
-        try:
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json={
-                    "model": "claude-3-sonnet-20240229",
-                    "max_tokens": 4096,
-                    "messages": messages,
-                    "temperature": 0.7
+                    }]
                 }
             )
             
@@ -234,6 +233,7 @@ Format your response as JSON with the following structure:
             
             # Post summary comment
             comments_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/comments"
+            print(f"Posting summary comment to: {comments_url}")
             response = requests.post(
                 comments_url, 
                 headers=self.headers, 
@@ -242,6 +242,7 @@ Format your response as JSON with the following structure:
             response.raise_for_status()
             
             # Post individual issue comments
+            print("Posting individual issue comments...")
             for issue in review['issues']:
                 severity_emoji = {
                     'high': '🔴',
@@ -266,6 +267,7 @@ Format your response as JSON with the following structure:
                 }
                 response = requests.post(comments_url, headers=self.headers, json=comment)
                 response.raise_for_status()
+                print(f"Posted comment for {issue['severity']} severity issue in {issue['file']}")
                 
         except requests.exceptions.RequestException as e:
             print(f"Failed to post comments: {e}")
@@ -274,13 +276,13 @@ Format your response as JSON with the following structure:
     def run_review(self) -> bool:
         """Execute the complete review process."""
         try:
-            print("🔍 Fetching PR changes...")
+            print("\n🔍 Fetching PR changes...")
             changes = self.get_pr_changes()
             
-            print("📝 Analyzing changes with Claude...")
+            print("\n📝 Analyzing changes with Claude...")
             review = self.analyze_with_claude(changes)
             
-            print("💬 Posting review comments...")
+            print("\n💬 Posting review comments...")
             self.post_comments(review)
             
             # Count high and medium severity issues
@@ -300,7 +302,7 @@ Review completed:
             return not should_fail
             
         except Exception as e:
-            print(f"❌ Error during review process: {e}")
+            print(f"\n❌ Error during review process: {e}")
             return False
 
 if __name__ == "__main__":
