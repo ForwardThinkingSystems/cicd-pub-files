@@ -131,23 +131,22 @@ class ClaudePRReviewer:
         """Send the code changes to Claude for analysis."""
         headers = {
             "Content-Type": "application/json",
-            "anthropic-version": "2024-01-01",
+            "anthropic-version": "2023-06-01",
             "x-api-key": self.claude_api_key
         }
         
         pr_description = changes['pr_info'].get('description', 'No description provided')
         pr_title = changes['pr_info'].get('title', 'Untitled PR')
         
-        # Construct the system and user messages
-        system_message = {
-            "role": "system",
-            "content": """You are a code review assistant. Analyze code changes and provide detailed feedback in JSON format.
-Your responses should be valid JSON objects containing 'summary', 'issues', 'recommendations', and 'positive_notes' fields."""
-        }
-        
-        user_message = {
-            "role": "user",
-            "content": f"""
+        # Construct the messages
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a code review assistant. Analyze code changes and provide detailed feedback in JSON format."
+            },
+            {
+                "role": "user",
+                "content": f"""
 {self.pre_prompt_text}
 
 Pull Request Information:
@@ -178,7 +177,8 @@ Format your response as JSON with the following structure:
     "recommendations": ["List of general recommendations"],
     "positive_notes": ["List of good practices identified"]
 }}"""
-        }
+            }
+        ]
 
         try:
             response = requests.post(
@@ -187,9 +187,8 @@ Format your response as JSON with the following structure:
                 json={
                     "model": "claude-3-sonnet-20240229",
                     "max_tokens": 4096,
-                    "messages": [system_message, user_message],
-                    "temperature": 0.7,
-                    "system": "You are a code review assistant that provides detailed, specific feedback."
+                    "messages": messages,
+                    "temperature": 0.7
                 }
             )
             
