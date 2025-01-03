@@ -61,7 +61,8 @@ class ClaudePRReviewer:
         
         self.headers = {
             'Authorization': f'Basic {self.auth_header}',
-            'Accept': 'application/json'
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
         }
         
         self.bb_api_base = f"https://api.bitbucket.org/2.0/repositories/{self.workspace}/{self.repo_slug}"
@@ -193,7 +194,7 @@ Format your response as JSON with this structure:
             low_count = sum(1 for i in issues_to_include if i['severity'] == 'low')
             
             # Create summary comment
-            summary_markdown = f"""# Claude Code Review Summary
+            summary_content = f"""# Claude Code Review Summary
 
 {review['summary']}
 
@@ -213,11 +214,14 @@ Format your response as JSON with this structure:
             # Post summary comment
             comments_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/comments"
             print(f"Posting summary comment to: {comments_url}")
-            response = requests.post(
-                comments_url, 
-                headers=self.headers, 
-                json={"content": {"raw": summary_markdown}}
-            )
+            
+            summary_data = {
+                "content": {
+                    "raw": summary_content
+                }
+            }
+            
+            response = requests.post(comments_url, headers=self.headers, json=summary_data)
             response.raise_for_status()
             
             # Post individual issue comments
@@ -229,27 +233,35 @@ Format your response as JSON with this structure:
                     'low': '🟢'
                 }.get(issue['severity'], '⚪️')
                 
-                comment = {
-                    "content": {
-                        "raw": f"""**{severity_emoji} {issue['severity'].upper()} Severity {issue['category'].title()} Issue**
+                issue_content = f"""**{severity_emoji} {issue['severity'].upper()} Severity {issue['category'].title()} Issue**
 
 {issue['description']}
 
 **Suggestion:** {issue['suggestion']}
 
 {f"✨ **Good Practice!**" if issue.get('good_practice', False) else ""}"""
-                    },
-                    "inline": {
+                
+                comment_data = {
+                    "content": {
+                        "raw": issue_content
+                    }
+                }
+                
+                # Add inline comment data if file and line are present
+                if issue.get('file') and issue.get('line'):
+                    comment_data['inline'] = {
                         "path": issue['file'],
                         "to": issue['line']
                     }
-                }
-                response = requests.post(comments_url, headers=self.headers, json=comment)
+                
+                response = requests.post(comments_url, headers=self.headers, json=comment_data)
                 response.raise_for_status()
-                print(f"Posted comment for {issue['severity']} severity issue in {issue['file']}")
+                print(f"Posted comment for {issue['severity']} severity issue in {issue.get('file', 'general comment')}")
                 
         except requests.exceptions.RequestException as e:
             print(f"Failed to post comments: {e}")
+            if hasattr(e.response, 'text'):
+                print(f"Response: {e.response.text}")
             raise
 
     def run_review(self) -> bool:
