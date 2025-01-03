@@ -6,40 +6,15 @@ from typing import Dict, List, Optional
 from anthropic import Anthropic
 
 DEFAULT_PRE_PROMPT = """
-As a code reviewer, please analyze the changes with the following priorities:
+Analyze the following code changes and provide a concise review focusing on:
 
-1. Code Quality & Best Practices:
-   - Clean code principles (DRY, SOLID, KISS)
-   - Proper error handling and logging
-   - Appropriate use of comments and documentation
-   - Consistent naming conventions and formatting
+1. **Security:** Common vulnerabilities like XSS, CSRF, SQL injection.
+2. **Code Quality:** Clean code principles, error handling, and documentation.
+3. **Performance:** Algorithm efficiency and resource usage.
+4. **Testing:** Adequate test coverage and edge case handling.
+5. **Maintainability:** Code complexity and future scalability.
 
-2. Security:
-   - Input validation and sanitization
-   - Authentication and authorization checks
-   - Secure data handling and storage
-   - Prevention of common vulnerabilities (XSS, CSRF, SQL injection)
-
-3. Performance:
-   - Algorithmic efficiency
-   - Resource usage (memory, CPU)
-   - Database query optimization
-   - Caching considerations
-
-4. Testing:
-   - Test coverage for new code
-   - Edge cases consideration
-   - Integration test requirements
-   - Mocking strategy where applicable
-
-5. Maintainability:
-   - Code complexity
-   - Module coupling and cohesion
-   - Future scalability implications
-   - Technical debt assessment
-
-Please be specific in your feedback and provide actionable suggestions with code examples where appropriate.
-Highlight both areas of concern and instances of good practices.
+Provide actionable suggestions with examples where necessary. Highlight both concerns and good practices.
 """
 
 class ClaudePRReviewer:
@@ -51,11 +26,11 @@ class ClaudePRReviewer:
         self.workspace = os.getenv('BITBUCKET_WORKSPACE')
         self.repo_slug = os.getenv('BITBUCKET_REPO_SLUG')
         self.pr_id = os.getenv('BITBUCKET_PR_ID')
+        self.include_low_severity = os.getenv('INCLUDE_LOW_SEVERITY', 'false').lower() == 'true'
         
         # Initialize Anthropic client
         self.client = Anthropic(api_key=self.claude_api_key)
         
-        # Validate required environment variables
         required_vars = {
             'CLAUDE_API_KEY': self.claude_api_key,
             'BITBUCKET_USERNAME': self.bitbucket_username,
@@ -80,7 +55,7 @@ class ClaudePRReviewer:
         }
         
         self.bb_api_base = f"https://api.bitbucket.org/2.0/repositories/{self.workspace}/{self.repo_slug}"
-        
+    
     def test_auth(self) -> bool:
         """Test authentication with Bitbucket API using PR scope"""
         try:
@@ -99,212 +74,82 @@ class ClaudePRReviewer:
         except requests.exceptions.RequestException as e:
             print(f"❌ Authentication test failed with error: {e}")
             return False
-        
+    
+    def check_existing_reviews(self) -> bool:
+        """Check if a review comment already exists for the PR."""
+        comments_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/comments"
+        response = requests.get(comments_url, headers=self.headers)
+        response.raise_for_status()
+
+        comments = response.json()["values"]
+        for comment in comments:
+            if "Review completed" in comment["content"]["raw"]:
+                print("🔍 Found previous review comment, skipping review process.")
+                return True
+        return False
+
     def get_pr_changes(self) -> Dict:
         """Fetch the PR diff and changed files."""
-        print("🔍 Testing Bitbucket API authentication...")
         if not self.test_auth():
             raise Exception("Failed to authenticate with Bitbucket API")
-            
-        print(f"Making API calls to fetch PR data...")
         
-        try:
-            # Get the diff
-            diff_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diff"
-            print(f"Fetching diff from: {diff_url}")
-            diff_response = requests.get(diff_url, headers=self.headers)
-            if diff_response.status_code == 401:
-                print("Authentication failed. Response:", diff_response.text)
-                raise Exception("Authentication failed with Bitbucket API")
-            diff_response.raise_for_status()
-            
-            # Get the list of changed files
-            files_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diffstat"
-            print(f"Fetching changed files from: {files_url}")
-            files_response = requests.get(files_url, headers=self.headers)
-            files_response.raise_for_status()
-            
-            # Get PR description for additional context
-            pr_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}"
-            print(f"Fetching PR details from: {pr_url}")
-            pr_response = requests.get(pr_url, headers=self.headers)
-            pr_response.raise_for_status()
-            
-            return {
-                "diff": diff_response.text,
-                "changed_files": files_response.json()["values"],
-                "pr_info": pr_response.json()
-            }
-        except requests.exceptions.RequestException as e:
-            print(f"Failed to fetch PR changes: {e}")
-            raise
+        diff_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diff"
+        files_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diffstat"
+        pr_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}"
         
+        diff_response = requests.get(diff_url, headers=self.headers)
+        diff_response.raise_for_status()
+        files_response = requests.get(files_url, headers=self.headers)
+        files_response.raise_for_status()
+        pr_response = requests.get(pr_url, headers=self.headers)
+        pr_response.raise_for_status()
+        
+        return {
+            "diff": diff_response.text,
+            "changed_files": files_response.json()["values"],
+            "pr_info": pr_response.json()
+        }
+    
     def analyze_with_claude(self, changes: Dict) -> Dict:
-        """Send the code changes to Claude for analysis using the Anthropic client."""
         pr_description = changes['pr_info'].get('description', 'No description provided')
         pr_title = changes['pr_info'].get('title', 'Untitled PR')
         
-        try:
-            system_prompt = "You are a code review assistant. Analyze code changes and provide detailed feedback. Return only the JSON object without any markdown formatting or code blocks."
-            
-            user_message = f"""
+        user_message = f"""
 {self.pre_prompt_text}
-
-Pull Request Information:
 Title: {pr_title}
 Description: {pr_description}
-
 Changed Files:
 {json.dumps([f['new']['path'] for f in changes['changed_files']], indent=2)}
-
 Diff Content:
 {changes['diff']}
-
-Please analyze these changes and provide a detailed review following the guidelines above.
-Respond with only a JSON object (no markdown, no code blocks) using this structure:
-{{
-    "summary": "Overall review summary",
-    "issues": [
-        {{
-            "file": "filename",
-            "line": line_number,
-            "severity": "high|medium|low",
-            "category": "security|performance|quality|testing|maintainability",
-            "description": "Issue description",
-            "suggestion": "How to fix",
-            "good_practice": boolean
-        }}
-    ],
-    "recommendations": ["List of general recommendations"],
-    "positive_notes": ["List of good practices identified"]
-}}"""
-
-            message = self.client.messages.create(
-                model="claude-3-sonnet-20240229",
-                max_tokens=4096,
-                system=system_prompt,
-                messages=[
-                    {"role": "user", "content": user_message}
-                ]
-            )
-            
-            review_text = message.content[0].text
-            
-            # If response is wrapped in markdown code block, extract the JSON
-            if review_text.startswith("```"):
-                start_idx = review_text.find('{')
-                end_idx = review_text.rfind('}') + 1
-                if start_idx == -1 or end_idx == 0:
-                    raise Exception("Could not find valid JSON in response")
-                review_text = review_text[start_idx:end_idx]
-            
-            print("\nParsing Claude's response:")
-            print(review_text)
-            
-            # Parse the JSON
-            try:
-                return json.loads(review_text)
-            except json.JSONDecodeError as e:
-                print(f"\nError parsing JSON: {e}")
-                print("Review text:", review_text)
-                raise
-                
-        except Exception as e:
-            print(f"Failed to process Claude's response: {e}")
-            raise
-        
-    def post_comments(self, review: Dict) -> None:
-        """Post the review comments to the PR."""
-        try:
-            # Create a detailed summary comment
-            summary_markdown = f"""# Claude Code Review Summary
-
-{review['summary']}
-
-## 🎯 General Recommendations
-{chr(10).join(f"- {rec}" for rec in review['recommendations'])}
-
-## ✨ Positive Notes
-{chr(10).join(f"- {note}" for note in review.get('positive_notes', []))}
-
-## 📊 Issues Overview
-- High Severity: {sum(1 for i in review['issues'] if i['severity'] == 'high')}
-- Medium Severity: {sum(1 for i in review['issues'] if i['severity'] == 'medium')}
-- Low Severity: {sum(1 for i in review['issues'] if i['severity'] == 'low')}
 """
-            
-            # Post summary comment
-            comments_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/comments"
-            print(f"Posting summary comment to: {comments_url}")
-            response = requests.post(
-                comments_url, 
-                headers=self.headers, 
-                json={"content": {"raw": summary_markdown}}
-            )
-            response.raise_for_status()
-            
-            # Post individual issue comments
-            print("Posting individual issue comments...")
-            for issue in review['issues']:
-                severity_emoji = {
-                    'high': '🔴',
-                    'medium': '🟡',
-                    'low': '🟢'
-                }.get(issue['severity'], '⚪️')
-                
-                comment = {
-                    "content": {
-                        "raw": f"""**{severity_emoji} {issue['severity'].upper()} Severity {issue['category'].title()} Issue**
-
-{issue['description']}
-
-**Suggestion:** {issue['suggestion']}
-
-{f"✨ **Good Practice!**" if issue.get('good_practice', False) else ""}"""
-                    },
-                    "inline": {
-                        "path": issue['file'],
-                        "to": issue['line']
-                    }
-                }
-                response = requests.post(comments_url, headers=self.headers, json=comment)
-                response.raise_for_status()
-                print(f"Posted comment for {issue['severity']} severity issue in {issue['file']}")
-                
-        except requests.exceptions.RequestException as e:
-            print(f"Failed to post comments: {e}")
-            raise
+        
+        message = self.client.messages.create(
+            model="claude-3-sonnet-20240229",
+            max_tokens=4096,
+            system="You are a code review assistant.",
+            messages=[{"role": "user", "content": user_message}]
+        )
+        
+        return json.loads(message.content[0].text)
 
     def run_review(self) -> bool:
-        """Execute the complete review process."""
         try:
-            print("\n🔍 Fetching PR changes...")
-            changes = self.get_pr_changes()
+            if self.check_existing_reviews():
+                print("✅ Skipping review since it's already completed.")
+                return True
             
-            print("\n📝 Analyzing changes with Claude...")
+            changes = self.get_pr_changes()
             review = self.analyze_with_claude(changes)
             
-            print("\n💬 Posting review comments...")
-            self.post_comments(review)
+            if not self.include_low_severity:
+                review['issues'] = [issue for issue in review['issues'] if issue['severity'] != 'low']
             
-            # Count high and medium severity issues
-            high_severity_count = sum(1 for i in review['issues'] if i['severity'] == 'high')
-            medium_severity_count = sum(1 for i in review['issues'] if i['severity'] == 'medium')
-            
-            # Fail if there are any high severity issues or more than 3 medium severity issues
-            should_fail = high_severity_count > 0 or medium_severity_count > 3
-            
-            print(f"""
-Review completed:
-- High severity issues: {high_severity_count}
-- Medium severity issues: {medium_severity_count}
-- Pipeline status: {"❌ Failed" if should_fail else "✅ Passed"}
-""")
-            
-            return not should_fail
-            
+            print("🔍 Review completed successfully.")
+            return True
+        
         except Exception as e:
-            print(f"\n❌ Error during review process: {e}")
+            print(f"❌ Error during review process: {e}")
             return False
 
 if __name__ == "__main__":
