@@ -1,6 +1,7 @@
 import os
 import requests
 import json
+import base64
 from typing import Dict, List, Optional
 
 DEFAULT_PRE_PROMPT = """
@@ -43,7 +44,8 @@ Highlight both areas of concern and instances of good practices.
 class ClaudePRReviewer:
     def __init__(self):
         self.claude_api_key = os.getenv('CLAUDE_API_KEY')
-        self.bitbucket_token = os.getenv('BITBUCKET_TOKEN')
+        self.bitbucket_username = os.getenv('BITBUCKET_USERNAME')
+        self.bitbucket_token = os.getenv('BITBUCKET_TOKEN')  # This should be your app password
         self.pre_prompt_text = os.getenv('PRE_PROMPT_TEXT', DEFAULT_PRE_PROMPT)
         self.workspace = os.getenv('BITBUCKET_WORKSPACE')
         self.repo_slug = os.getenv('BITBUCKET_REPO_SLUG')
@@ -52,6 +54,7 @@ class ClaudePRReviewer:
         # Validate required environment variables
         required_vars = {
             'CLAUDE_API_KEY': self.claude_api_key,
+            'BITBUCKET_USERNAME': self.bitbucket_username,
             'BITBUCKET_TOKEN': self.bitbucket_token,
             'BITBUCKET_WORKSPACE': self.workspace,
             'BITBUCKET_REPO_SLUG': self.repo_slug,
@@ -62,31 +65,52 @@ class ClaudePRReviewer:
         if missing_vars:
             raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_vars)}")
         
+        # Create auth string for basic auth
+        auth_str = f"{self.bitbucket_username}:{self.bitbucket_token}"
+        auth_bytes = auth_str.encode('ascii')
+        self.auth_header = base64.b64encode(auth_bytes).decode('ascii')
+        
+        self.headers = {
+            'Authorization': f'Basic {self.auth_header}',
+            'Accept': 'application/json'
+        }
+        
         self.bb_api_base = f"https://api.bitbucket.org/2.0/repositories/{self.workspace}/{self.repo_slug}"
+        
+    def test_auth(self) -> bool:
+        """Test authentication with Bitbucket API"""
+        test_url = f"https://api.bitbucket.org/2.0/repositories/{self.workspace}"
+        response = requests.get(test_url, headers=self.headers)
+        if response.status_code != 200:
+            print(f"Authentication test failed with status {response.status_code}")
+            print("Response:", response.text)
+            return False
+        return True
         
     def get_pr_changes(self) -> Dict:
         """Fetch the PR diff and changed files."""
-        headers = {"Authorization": f"Bearer {self.bitbucket_token}"}
-        
+        print(f"Testing Bitbucket API authentication...")
+        if not self.test_auth():
+            raise Exception("Failed to authenticate with Bitbucket API")
+            
         print(f"Making API call to: {self.bb_api_base}/pullrequests/{self.pr_id}/diff")
         
         # Get the diff
         diff_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diff"
-        diff_response = requests.get(diff_url, headers=headers)
+        diff_response = requests.get(diff_url, headers=self.headers)
         if diff_response.status_code == 401:
-            print("Authentication failed. Please check the BITBUCKET_TOKEN value.")
-            print("Response:", diff_response.text)
+            print("Authentication failed. Response:", diff_response.text)
             raise Exception("Authentication failed with Bitbucket API")
         diff_response.raise_for_status()
         
         # Get the list of changed files
         files_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diffstat"
-        files_response = requests.get(files_url, headers=headers)
+        files_response = requests.get(files_url, headers=self.headers)
         files_response.raise_for_status()
         
         # Get PR description for additional context
         pr_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}"
-        pr_response = requests.get(pr_url, headers=headers)
+        pr_response = requests.get(pr_url, headers=self.headers)
         pr_response.raise_for_status()
         
         return {
@@ -158,11 +182,6 @@ Format your response as JSON with the following structure:
         
     def post_comments(self, review: Dict) -> None:
         """Post the review comments to the PR."""
-        headers = {
-            "Authorization": f"Bearer {self.bitbucket_token}",
-            "Content-Type": "application/json"
-        }
-        
         # Create a detailed summary comment
         summary_markdown = f"""# Claude Code Review Summary
 
@@ -184,7 +203,7 @@ Format your response as JSON with the following structure:
         comments_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/comments"
         response = requests.post(
             comments_url, 
-            headers=headers, 
+            headers=self.headers, 
             json={"content": {"raw": summary_markdown}}
         )
         response.raise_for_status()
@@ -212,7 +231,7 @@ Format your response as JSON with the following structure:
                     "to": issue['line']
                 }
             }
-            response = requests.post(comments_url, headers=headers, json=comment)
+            response = requests.post(comments_url, headers=self.headers, json=comment)
             response.raise_for_status()
 
     def run_review(self) -> bool:
