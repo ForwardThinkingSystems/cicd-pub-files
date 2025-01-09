@@ -7,15 +7,40 @@ from typing import Dict, List, Optional
 from anthropic import Anthropic
 
 DEFAULT_PRE_PROMPT = """
-Analyze the following code changes and provide a concise review focusing on:
+As a code reviewer, please analyze the changes with the following priorities:
 
-1. **Security:** Common vulnerabilities like XSS, CSRF, SQL injection.
-2. **Code Quality:** Clean code principles, error handling, and documentation.
-3. **Performance:** Algorithm efficiency and resource usage.
-4. **Testing:** Adequate test coverage and edge case handling.
-5. **Maintainability:** Code complexity and future scalability.
+1. Code Quality & Best Practices:
+   - Clean code principles (DRY, SOLID, KISS)
+   - Proper error handling and logging
+   - Appropriate use of comments and documentation
+   - Consistent naming conventions and formatting
 
-Provide actionable suggestions with examples where necessary. Highlight both concerns and good practices.
+2. Security:
+   - Input validation and sanitization
+   - Authentication and authorization checks
+   - Secure data handling and storage
+   - Prevention of common vulnerabilities (XSS, CSRF, SQL injection)
+
+3. Performance:
+   - Algorithmic efficiency
+   - Resource usage (memory, CPU)
+   - Database query optimization
+   - Caching considerations
+
+4. Testing:
+   - Test coverage for new code
+   - Edge cases consideration
+   - Integration test requirements
+   - Mocking strategy where applicable
+
+5. Maintainability:
+   - Code complexity
+   - Module coupling and cohesion
+   - Future scalability implications
+   - Technical debt assessment
+
+Please be specific in your feedback and provide actionable suggestions with code examples where appropriate.
+Highlight both areas of concern and instances of good practices.
 """
 
 class ClaudePRReviewer:
@@ -116,23 +141,35 @@ class ClaudePRReviewer:
         if not self.test_auth():
             raise Exception("Failed to authenticate with Bitbucket API")
         
-        diff_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diff"
-        files_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diffstat"
-        pr_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}"
+        try:
+            # Get the diff
+            diff_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diff"
+            print(f"Fetching diff from: {diff_url}")
+            diff_response = requests.get(diff_url, headers=self.headers)
+            diff_response.raise_for_status()
+            
+            # Get the list of changed files
+            files_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/diffstat"
+            print(f"Fetching changed files from: {files_url}")
+            files_response = requests.get(files_url, headers=self.headers)
+            files_response.raise_for_status()
+            
+            # Get PR description for additional context
+            pr_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}"
+            print(f"Fetching PR details from: {pr_url}")
+            pr_response = requests.get(pr_url, headers=self.headers)
+            pr_response.raise_for_status()
+            
+            return {
+                "diff": diff_response.text,
+                "changed_files": files_response.json()["values"],
+                "pr_info": pr_response.json()
+            }
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Failed to fetch PR changes: {e}")
+            raise
         
-        diff_response = requests.get(diff_url, headers=self.headers)
-        diff_response.raise_for_status()
-        files_response = requests.get(files_url, headers=self.headers)
-        files_response.raise_for_status()
-        pr_response = requests.get(pr_url, headers=self.headers)
-        pr_response.raise_for_status()
-        
-        return {
-            "diff": diff_response.text,
-            "changed_files": files_response.json()["values"],
-            "pr_info": pr_response.json()
-        }
-    
     def analyze_with_claude(self, changes: Dict) -> Dict:
         """Send the code changes to Claude for analysis."""
         pr_description = changes['pr_info'].get('description', 'No description provided')
@@ -151,7 +188,7 @@ Diff Content:
 {changes['diff']}
 
 Please analyze these changes and provide a detailed review following the guidelines above.
-Format your response as JSON with this structure:
+Format your response as a valid JSON object with this structure:
 {{
     "summary": "Overall review summary",
     "issues": [
@@ -168,16 +205,43 @@ Format your response as JSON with this structure:
     "recommendations": ["List of general recommendations"],
     "positive_notes": ["List of good practices identified"]
 }}
-"""
+
+Important: Respond with ONLY the JSON object, no additional text, markdown, or code blocks."""
         
-        message = self.client.messages.create(
-            model="claude-3-sonnet-20240229",
-            max_tokens=4096,
-            system="You are a code review assistant. Return only valid JSON without any markdown formatting.",
-            messages=[{"role": "user", "content": user_message}]
-        )
-        
-        return json.loads(message.content[0].text)
+        try:
+            message = self.client.messages.create(
+                model="claude-3-sonnet-20240229",
+                max_tokens=4096,
+                system="You are a code review assistant. Return only a valid JSON object without any markdown, explanations, or code blocks.",
+                messages=[{"role": "user", "content": user_message}]
+            )
+            
+            # Get response text and clean it
+            response_text = message.content[0].text.strip()
+            
+            # Remove any markdown code block markers if present
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            if response_text.startswith("```"):
+                response_text = response_text[3:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+            
+            response_text = response_text.strip()
+            
+            # Try to parse the JSON
+            try:
+                review_data = json.loads(response_text)
+                return review_data
+            except json.JSONDecodeError as e:
+                print(f"Failed to parse Claude's response as JSON: {e}")
+                print("Response content:")
+                print(response_text)
+                raise
+                
+        except Exception as e:
+            print(f"Error during Claude API call: {e}")
+            raise
 
     def post_comments(self, review: Dict) -> None:
         """Post the review comments to the PR."""
@@ -194,7 +258,7 @@ Format your response as JSON with this structure:
             low_count = sum(1 for i in issues_to_include if i['severity'] == 'low')
             
             # Create summary comment
-            summary_content = f"""# Claude Code Review Summary
+            summary_markdown = f"""# Claude Code Review Summary
 
 {review['summary']}
 
@@ -215,13 +279,11 @@ Format your response as JSON with this structure:
             comments_url = f"{self.bb_api_base}/pullrequests/{self.pr_id}/comments"
             print(f"Posting summary comment to: {comments_url}")
             
-            summary_data = {
-                "content": {
-                    "raw": summary_content
-                }
-            }
-            
-            response = requests.post(comments_url, headers=self.headers, json=summary_data)
+            response = requests.post(
+                comments_url, 
+                headers=self.headers, 
+                json={"content": {"raw": summary_markdown}}
+            )
             response.raise_for_status()
             
             # Post individual issue comments
@@ -233,28 +295,26 @@ Format your response as JSON with this structure:
                     'low': '🟢'
                 }.get(issue['severity'], '⚪️')
                 
-                issue_content = f"""**{severity_emoji} {issue['severity'].upper()} Severity {issue['category'].title()} Issue**
+                comment = {
+                    "content": {
+                        "raw": f"""**{severity_emoji} {issue['severity'].upper()} Severity {issue['category'].title()} Issue**
 
 {issue['description']}
 
 **Suggestion:** {issue['suggestion']}
 
 {f"✨ **Good Practice!**" if issue.get('good_practice', False) else ""}"""
-                
-                comment_data = {
-                    "content": {
-                        "raw": issue_content
                     }
                 }
                 
                 # Add inline comment data if file and line are present
                 if issue.get('file') and issue.get('line'):
-                    comment_data['inline'] = {
+                    comment['inline'] = {
                         "path": issue['file'],
                         "to": issue['line']
                     }
                 
-                response = requests.post(comments_url, headers=self.headers, json=comment_data)
+                response = requests.post(comments_url, headers=self.headers, json=comment)
                 response.raise_for_status()
                 print(f"Posted comment for {issue['severity']} severity issue in {issue.get('file', 'general comment')}")
                 
