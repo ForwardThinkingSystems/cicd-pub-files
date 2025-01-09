@@ -9,6 +9,8 @@ from anthropic import Anthropic
 DEFAULT_PRE_PROMPT = """
 As a code reviewer, please analyze the changes with the following priorities:
 
+Give a summary of all changes in the PR
+
 1. Code Quality & Best Practices:
    - Clean code principles (DRY, SOLID, KISS)
    - Proper error handling and logging
@@ -40,7 +42,7 @@ As a code reviewer, please analyze the changes with the following priorities:
    - Technical debt assessment
 
 Please be specific in your feedback and provide actionable suggestions with code examples where appropriate.
-Highlight both areas of concern and instances of good practices.
+Highlight both areas of concern and instances of good practices. Also, consider that you don't see the whole code base with a PR; it's just the changed files.
 """
 
 class ClaudePRReviewer:
